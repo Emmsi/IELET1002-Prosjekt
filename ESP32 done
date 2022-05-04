@@ -1,0 +1,292 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <PubSubClient.h>
+
+// String splitting og variabelkonvertering
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+
+// Internet og server ip/connection
+const char *ssid = "RUTERNAVN";
+const char *password = "PW";
+const char *mqtt_server = "10.0.0.91"; // hostname -I på RPI, IP til de tilkoblede nettverket
+
+
+// Setter opp klienter
+WiFiClient espClient;
+PubSubClient client(espClient);
+
+// Tekst sendt fra node-RED
+String messageTemp;
+
+// Sensor data
+unsigned long previousMillis = 0;
+unsigned long currentMillis = 0;
+const int dataDelay = 500;    // 0,5 sek
+const int sensorTime = 5 * 2; // 5 i sekunder
+const int photoPin = 35;
+const int tempPin = 34;
+float photo = 0;
+float temp = 0;
+
+// Bankkonto
+int saldo = 0;
+int courseChoice = 0;
+
+// ESP32-zumo kommunikasjon
+String received;
+
+// Funksjoner deklarasjoner
+void callback(char *topic, byte *message, unsigned int length);
+void reconnect();
+void course_check();
+void bank_acc();
+void zumo_data();
+
+void setup()
+{
+  Serial.begin(9600);  // Serial is the normal serial monitor communication
+  Serial1.begin(9600); // Receives data from Zumo and sends data to Zumo
+
+  analogReadResolution(12);
+
+  // wifi connection setup
+  Serial.setDebugOutput(true);
+  Serial.println();
+  Serial.println();
+  Serial.println();
+
+  for (uint8_t t = 4; t > 0; t--)
+  {
+    Serial.printf("[SETUP] BOOT WAIT %d...\n", t);
+    Serial.flush();
+    delay(1000);
+  }
+
+  WiFi.begin(ssid, password); // Connect to your wi-fi modem
+  while (WiFi.status() != WL_CONNECTED)
+  {
+    Serial.println("Establishing connection to WiFi...");
+    delay(1000);
+  }
+
+  Serial.println("Connected");
+  Serial.println(WiFi.localIP());
+
+  // setter serveren til mqtt, RPI port
+  client.setServer(mqtt_server, 1883);
+  client.setCallback(callback); // fått mld, sender funksjon topic, meldingen, meldingens lengde
+}
+
+void loop()
+{
+  // Hvis ikke kobla til, koble til funksjon
+  if (!client.connected())
+  {
+    reconnect();
+  }
+  client.loop();
+
+  zumo_data();
+}
+
+// tar inn funksjon topic, meldingen, meldingens lengde fra MQTT
+void callback(char *topic, byte *message, unsigned int length)
+{
+  // løkke nedenfor setter sammen pub mld
+  for (int i = 0; i < length; i++)
+  {
+    messageTemp += (char)message[i];
+  }
+
+  // for å sjekke hva som inkommer i RPI: mosquitto_sub -d -t esp32/sensor_data
+  if (String(topic) == "esp32/sensor_data")
+  {
+    switch (messageTemp[0])
+    {
+    // Om "Check Environment" klikkes i node-RED
+    // så kjører course_check() funksjonen
+    case 's':
+      course_check();
+      break;
+
+    // sender photoresistor data på knappetrykk
+    case 'p':
+      char tempString[8];
+      photo = (analogRead(photoPin) * 3.3) / 4095;
+      dtostrf(photo, 1, 2, tempString);
+      client.publish("esp32/photo_output", tempString);
+      break;
+
+    // sender temperatur data på knappetrykk
+    case 't':
+      char tempString1[8];
+      temp = (((analogRead(tempPin) * 3.3) / 4095) - 0.5) * 100;
+      dtostrf(temp, 1, 2, tempString1);
+      client.publish("esp32/temp_output", tempString1);
+      break;
+    }
+    messageTemp = "";
+  }
+
+  if (String(topic) == "esp32/car_choice")
+  {
+    switch (messageTemp[0])
+    {
+    case 'a':
+      // bane1 funksjon
+      courseChoice = 1;
+      Serial.print("a");
+      break;
+
+    case 'b':
+      // bane2 funksjon
+      courseChoice = 2;
+      Serial.print("b");
+      break;
+
+    case 'c':
+      // lade funksjone
+      courseChoice = 3;
+      Serial.print("c");
+      break;
+
+    case 'f':
+      bank_acc();
+      break;
+    }
+    messageTemp = "";
+  }
+}
+
+// kobler esp til mqtt og riktig topic
+void reconnect()
+{
+  while (!client.connected())
+  {
+    if (client.connect("ESP8266Client"))
+    {
+      client.subscribe("esp32/sensor_data");
+      client.subscribe("esp32/car_choice");
+    }
+    else
+    {
+      delay(5000);
+    }
+  }
+}
+
+// sender data fra sensordata til node-RED hvert 0.5 sek
+// vil sende notification i node-RED om at banen er klar
+void course_check()
+{
+  int counter = 0;
+  while (1)
+  {
+    currentMillis = millis();
+
+    if (currentMillis - previousMillis >= dataDelay)
+    {
+      previousMillis = currentMillis;
+      char tempString[8];
+      char tempString1[8];
+      photo = (analogRead(photoPin) * 3.3) / 4095;
+      temp = (((analogRead(tempPin) * 3.3) / 4095) - 0.5) * 100;
+      dtostrf(photo, 1, 2, tempString);
+      dtostrf(temp, 1, 2, tempString1);
+      client.publish("esp32/photo_output", tempString);
+      client.publish("esp32/temp_output", tempString1);
+      counter++;
+    }
+
+    if (counter == sensorTime)
+    {
+      client.publish("esp32/course_check", "The course is ready");
+      counter = 0;
+      break;
+    }
+  }
+}
+
+void bank_acc()
+{
+  char tempString2[8];
+
+  switch (courseChoice)
+  {
+  // hvis bane1
+  case 1:
+    saldo += 1200;
+    break;
+
+  // hvis bane2
+  case 2:
+    saldo += 800;
+    break;
+
+  // hvis lading
+  case 3:
+    saldo -= 600;
+    break;
+
+  default:
+    client.publish("esp32/bank_warning", "You don't have any transactions");
+  }
+
+  dtostrf(saldo, 1, 2, tempString2);
+  client.publish("esp32/bank", tempString2);
+  courseChoice = 0;
+}
+
+void zumo_data()
+{
+  while (Serial.available() > 0)
+  {
+    // leser input strengen fram til ; og lagrer i en variabel
+    String speedometer = Serial.readStringUntil(';'); // writes in the string all the inputs till a comma
+    String batterylvl = Serial.readStringUntil(';');
+    String avgStr = Serial.readStringUntil(';');
+    String totStr = Serial.readStringUntil(';');
+    String over70Str = Serial.readStringUntil('\n');
+
+    // caster strengen til float og splitter til array for å publisere i node-RED
+    char speed[10];
+    char batteryTemp[15];
+    char avgSpeed[15];
+    char totDistance[15];
+    char over70[15];
+    char battery[15];
+    char batHealth[15];
+    dtostrf(speedometer.toFloat(), 1, 2, speed);
+    dtostrf(batterylvl.toFloat(), 1, 2, batteryTemp);
+    dtostrf(avgStr.toFloat(), 1, 2, avgSpeed);
+    dtostrf(totStr.toFloat(), 1, 2, totDistance);
+    dtostrf(over70Str.toFloat(), 1, 2, over70);
+
+    // gjør om batteri til prosent og helse til 0-100 skala
+    float batteryPercent = atof(batteryTemp) * 100 / 8800;
+    float health = constrain(atof(batteryTemp), 0, 100);
+    dtostrf(batteryPercent, 1, 2, battery);
+
+    // Publiserer verdier i node-RED
+    client.publish("esp32/speedometer", speed);
+    client.publish("esp32/battery", battery);
+    client.publish("esp32/avg_speed", avgSpeed);
+    client.publish("esp32/distance", totDistance);
+    client.publish("esp32/time_over70", over70);
+
+    if (health >= 70)
+    {
+      client.publish("esp32/battery_health", "good");
+    }
+    else if (health > 30 && health < 70)
+    {
+      client.publish("esp32/battery_health", "okay");
+    }
+    else if (health <= 30)
+    {
+      client.publish("esp32/battery_health", "bad");
+    }
+  }
+}
